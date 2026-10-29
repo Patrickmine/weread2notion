@@ -163,7 +163,7 @@ class ReadingPropertiesTests(unittest.TestCase):
             cli.refresh_reading_properties("111")
         cli.client.pages.update.assert_not_called()
 
-    def install_sync_fakes(self, pages, notebooks, progress):
+    def install_sync_fakes(self, pages, notebooks, progress, shelf=None):
         """Exercise the real sync, create, refresh, chapter and note functions."""
         notion, gateway = cli.client, cli.weread
 
@@ -195,6 +195,8 @@ class ReadingPropertiesTests(unittest.TestCase):
         def gateway_request(api_name, **kwargs):
             if api_name == "/user/notebooks":
                 return {"books": notebooks, "hasMore": 0}
+            if api_name == "/shelf/sync":
+                return {"books": shelf or []}
             if api_name == "/book/getprogress":
                 return {"book": progress[kwargs["bookId"]]}
             if api_name == "/book/info":
@@ -273,7 +275,7 @@ class ReadingPropertiesTests(unittest.TestCase):
         notion.pages.create.assert_not_called()
         notion.blocks.delete.assert_not_called()
         notion.blocks.children.append.assert_not_called()
-        self.assertEqual(len(gateway.request.call_args_list), 3)  # notebooks + 2 progress reads
+        self.assertEqual(len(gateway.request.call_args_list), 4)  # notebooks + shelf + 2 progress
 
     def test_original_sort_triggered_rebuild_remains_single_path(self):
         pages = {"111": make_page(sort=5)}
@@ -316,6 +318,83 @@ class ReadingPropertiesTests(unittest.TestCase):
         notion.blocks.delete.assert_not_called()
         self.assertEqual(sum(c.args == ("/book/getprogress",)
                              for c in gateway.request.call_args_list), 1)
+
+    def test_shelf_book_without_notes_refreshes_existing_notion_page(self):
+        pages = {"333": make_page("333")}
+        original = copy.deepcopy(pages["333"])
+        notion, gateway = self.install_sync_fakes(
+            pages, [], {"333": {"progress": 45, "updateTime": STAMP}},
+            shelf=[{"bookId": "333", "readUpdateTime": 1, "finishReading": 1}])
+        cli.sync()
+        notion.pages.update.assert_called_once_with(page_id="page-333", properties={
+            "阅读状态": {"status": {"name": "在读"}},
+            "最后阅读时间": {"date": {"start": ISO, "end": None, "time_zone": None}},
+        })
+        for name, value in original["properties"].items():
+            if name not in ("阅读状态", "最后阅读时间"):
+                self.assertEqual(pages["333"]["properties"][name], value)
+        notion.pages.create.assert_not_called()
+        notion.blocks.delete.assert_not_called()
+        notion.blocks.children.append.assert_not_called()
+        self.assertEqual([c.args[0] for c in gateway.request.call_args_list],
+                         ["/user/notebooks", "/shelf/sync", "/book/getprogress"])
+        notion.pages.update.reset_mock()
+        cli.sync()
+        notion.pages.update.assert_not_called()
+
+    def test_shelf_and_notebooks_overlap_is_processed_once_per_book(self):
+        pages = {"111": make_page(), "333": make_page("333")}
+        notebooks = [{"sort": 5, "book": {"bookId": "111"}},
+                     {"sort": 11, "book": {"bookId": "222", "title": "New"}}]
+        shelf = [{"bookId": "111"}, {"bookId": "222"}, {"bookId": "333"},
+                 {"bookId": "333"}, {"bookId": 333}, {"title": "Missing ID"}]
+        progress = {book_id: {"progress": 45, "updateTime": STAMP}
+                    for book_id in ("111", "222", "333")}
+        notion, gateway = self.install_sync_fakes(pages, notebooks, progress, shelf)
+        cli.sync()
+        self.assertEqual(notion.pages.update.call_count, 2)
+        notion.pages.create.assert_called_once()
+        for book_id in progress:
+            self.assertEqual(sum(c.args == ("/book/getprogress",)
+                                 and c.kwargs == {"bookId": book_id}
+                                 for c in gateway.request.call_args_list), 1)
+            queries = [c for c in notion.request.call_args_list
+                       if (c.kwargs.get("body") or {}).get("filter", {}).get("rich_text", {})
+                       .get("equals") == book_id]
+            self.assertEqual(len(queries), 1)
+        self.assertEqual(sum(c.args == ("/shelf/sync",) for c in gateway.request.call_args_list), 1)
+
+    def test_shelf_unmatched_book_is_not_created_or_queried_for_progress(self):
+        notion, gateway = self.install_sync_fakes({}, [], {}, shelf=[{"bookId": "444"}])
+        cli.sync()
+        notion.pages.create.assert_not_called()
+        notion.pages.update.assert_not_called()
+        notion.blocks.delete.assert_not_called()
+        self.assertEqual([c.args[0] for c in gateway.request.call_args_list],
+                         ["/user/notebooks", "/shelf/sync"])
+
+    def test_shelf_failure_keeps_original_notebook_sync_result(self):
+        notion, gateway = self.install_sync_fakes(
+            {}, [{"sort": 11, "bookId": "222", "title": "New"}],
+            {"222": {"progress": 1, "updateTime": STAMP}})
+        original_request = gateway.request.side_effect
+
+        def fail_shelf(api_name, **kwargs):
+            if api_name == "/shelf/sync":
+                raise RuntimeError("Synthetic shelf failure")
+            return original_request(api_name, **kwargs)
+
+        gateway.request.side_effect = fail_shelf
+        cli.sync()
+        notion.pages.create.assert_called_once()
+        self.assertEqual(notion.blocks.children.append.call_count, 2)
+        notion.pages.update.assert_not_called()
+
+    def test_shelf_is_not_requested_without_target_properties(self):
+        cli.data_source_property_types = {"阅读状态": "select", "最后阅读时间": "rich_text"}
+        cli.refresh_shelf_reading_properties(set())
+        cli.weread.request.assert_not_called()
+        cli.client.request.assert_not_called()
 
 
 if __name__ == "__main__":

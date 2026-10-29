@@ -287,7 +287,7 @@ def reading_date_matches(current, desired):
 
 
 def refresh_reading_properties(bookId):
-    """Refresh a Sort-skipped book in place, without touching page contents."""
+    """Refresh an existing book in place, without touching page contents."""
     if not (
         get_property_type("阅读状态") == "status"
         or get_property_type("最后阅读时间") == "date"
@@ -317,6 +317,28 @@ def refresh_reading_properties(bookId):
             changes[name] = value
     if changes:
         client.pages.update(page_id=page["id"], properties=changes)
+
+
+def refresh_shelf_reading_properties(notebook_book_ids):
+    """Cover books without notes; notebook books already have their own path."""
+    if not (
+        get_property_type("阅读状态") == "status"
+        or get_property_type("最后阅读时间") == "date"
+    ):
+        return
+    try:
+        books = weread.request("/shelf/sync").get("books") or []
+    except Exception as error:
+        print(f"书架读取失败，跳过补充属性刷新，原笔记同步结果保留: {error}")
+        return
+    seen = {str(book_id) for book_id in notebook_book_ids if book_id}
+    for book in books:
+        book_id = book.get("bookId")
+        if not book_id or str(book_id) in seen:
+            continue
+        book_id = str(book_id)
+        seen.add(book_id)
+        refresh_reading_properties(book_id)
 
 
 def normalize_reading_progress(value):
@@ -954,6 +976,9 @@ def sync():
             results = add_children(id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
+    refresh_shelf_reading_properties({
+        (item.get("book") or item).get("bookId") for item in (books or [])
+    })
 
 
 def main(argv=None):
