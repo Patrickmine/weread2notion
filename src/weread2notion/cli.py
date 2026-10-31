@@ -5,8 +5,10 @@ import re
 import time
 from notion_client import Client
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
+import math
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
 from retrying import retry
@@ -209,7 +211,134 @@ def get_read_info(bookId):
         "readingTime": book.get("recordReadingTime") or 0,
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
+        "readingStatus": get_reading_status(book),
+        "lastReadTime": reading_timestamp_to_iso(book.get("updateTime")),
     }
+
+
+def get_reading_status(book):
+    """Official progress is an integer percentage, not a 0–1 ratio."""
+    raw_progress = book.get("progress")
+    progress = to_number(raw_progress)
+    if (
+        isinstance(raw_progress, bool)
+        or progress is None
+        or not math.isfinite(progress)
+        or not 0 <= progress <= 100
+        or progress != int(progress)
+    ):
+        return None
+    if progress == 100:
+        return "已读"
+    if progress > 0:
+        return "在读"
+    started = book.get("isStartReading")
+    if started in (True, 1, "1"):
+        return "在读"
+    if started in (None, False, 0, "0"):
+        return "想读"
+    return None
+
+
+def reading_timestamp_to_iso(value):
+    """Convert Unix seconds; invalid/missing values must not clear old dates."""
+    timestamp = to_number(value)
+    if (
+        isinstance(value, bool)
+        or timestamp is None
+        or not math.isfinite(timestamp)
+        or timestamp <= 0
+    ):
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def build_reading_properties(read_info):
+    """Only the two existing legacy-template properties belong to this path."""
+    properties = {}
+    if get_property_type("阅读状态") == "status" and read_info.get("readingStatus"):
+        properties["阅读状态"] = get_status(read_info["readingStatus"])
+    if get_property_type("最后阅读时间") == "date" and read_info.get("lastReadTime"):
+        # Do not use get_date(): it adds Asia/Shanghai to a UTC clock value.
+        properties["最后阅读时间"] = {
+            "date": {"start": read_info["lastReadTime"], "end": None, "time_zone": None}
+        }
+    return properties
+
+
+def reading_date_matches(current, desired):
+    if not current or current.get("end"):
+        return False
+    try:
+        start = current["start"]
+        if "T" not in start:
+            return False
+        actual = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        if actual.tzinfo is None:
+            if not current.get("time_zone"):
+                return False
+            actual = actual.replace(tzinfo=ZoneInfo(current["time_zone"]))
+        return actual == datetime.fromisoformat(desired["start"])
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return False
+
+
+def refresh_reading_properties(bookId):
+    """Refresh an existing book in place, without touching page contents."""
+    if not (
+        get_property_type("阅读状态") == "status"
+        or get_property_type("最后阅读时间") == "date"
+    ):
+        return
+    response = query_data_source(filter=build_equals_filter("BookId", bookId), page_size=2)
+    pages = response.get("results") or []
+    if len(pages) > 1 or response.get("has_more"):
+        print(f"BookId {bookId} 匹配到重复页面，跳过属性刷新")
+        return
+    if not pages:
+        return
+    try:
+        desired = build_reading_properties(get_read_info(bookId))
+    except Exception as error:
+        print(f"BookId {bookId} 阅读进度读取失败，保留已有属性: {error}")
+        return
+    page = pages[0]
+    current = page.get("properties") or {}
+    changes = {}
+    for name, value in desired.items():
+        existing = current.get(name) or {}
+        if name == "阅读状态":
+            if (existing.get("status") or {}).get("name") != value["status"]["name"]:
+                changes[name] = value
+        elif not reading_date_matches(existing.get("date"), value["date"]):
+            changes[name] = value
+    if changes:
+        client.pages.update(page_id=page["id"], properties=changes)
+
+
+def refresh_shelf_reading_properties(notebook_book_ids):
+    """Cover books without notes; notebook books already have their own path."""
+    if not (
+        get_property_type("阅读状态") == "status"
+        or get_property_type("最后阅读时间") == "date"
+    ):
+        return
+    try:
+        books = weread.request("/shelf/sync").get("books") or []
+    except Exception as error:
+        print(f"书架读取失败，跳过补充属性刷新，原笔记同步结果保留: {error}")
+        return
+    seen = {str(book_id) for book_id in notebook_book_ids if book_id}
+    for book in books:
+        book_id = book.get("bookId")
+        if not book_id or str(book_id) in seen:
+            continue
+        book_id = str(book_id)
+        seen.add(book_id)
+        refresh_reading_properties(book_id)
 
 
 def normalize_reading_progress(value):
@@ -304,11 +433,10 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         raw_properties["分类"] = categories
     read_info = (
         get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
+        if has_any_property(("阅读状态", "最后阅读时间", "阅读时长", "阅读进度", "时间"))
         else None
     )
     if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
         readingProgress = read_info.get("readingProgress", 0)
         format_time = ""
@@ -318,7 +446,6 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         minutes = readingTime % 3600 // 60
         if minutes > 0:
             format_time += f"{minutes}分"
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读时长"] = format_time
         raw_properties["阅读进度"] = readingProgress
         if "finishedDate" in read_info:
@@ -329,6 +456,8 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
             )
 
     properties = build_notion_properties(raw_properties)
+    if read_info is not None:
+        properties.update(build_reading_properties(read_info))
     icon = get_icon(cover)
     # notion api 限制100个block
     response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
@@ -799,9 +928,22 @@ def sync():
     latest_sort = get_sort()
     books = get_notebooklist()
     if books != None:
+        # A BookId handled by the original path must never be refreshed first,
+        # even if it appears twice across notebook-list pagination boundaries.
+        full_sync_book_ids = {
+            (item.get("book") or item).get("bookId")
+            for item in books if item["sort"] > latest_sort
+        }
+        refreshed_book_ids = set()
         for index, book in enumerate(books):
             sort = book["sort"]
             if sort <= latest_sort:
+                skipped_book = book.get("book") or book
+                skipped_id = skipped_book.get("bookId")
+                if (skipped_id and skipped_id not in full_sync_book_ids
+                        and skipped_id not in refreshed_book_ids):
+                    refreshed_book_ids.add(skipped_id)
+                    refresh_reading_properties(skipped_id)
                 continue
             book = book.get("book") or book
             title = book.get("title") or ""
@@ -834,6 +976,9 @@ def sync():
             results = add_children(id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
+    refresh_shelf_reading_properties({
+        (item.get("book") or item).get("bookId") for item in (books or [])
+    })
 
 
 def main(argv=None):
