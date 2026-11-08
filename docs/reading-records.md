@@ -13,23 +13,44 @@ Read-only inspection confirmed the selected original template, not its duplicate
 
 At runtime the module verifies actual schemas, relation destinations, reciprocal links and SUM rollups before writing. Names alone are insufficient. Multiple matching databases/data sources, duplicate involved daily dates/cycles and conflicting nonempty relations fail before apply. Duplicate checks exclude dates without returned API buckets and unrelated historical cycles. Existing daily titles, dates, timestamps, manual content, bookshelf/note/highlight relations and all older records outside the selected interval are preserved. Only duration changes and missing period links are patched. Missing period pages are created in existing databases, never replacing databases. New period pages contain properties; custom template page bodies are not copied.
 
-## Configuration and execution
+## First deployment: read-only by default
 
-Reuse existing secrets. `READING_RECORDS_PAGE` is an optional **repository variable**, containing the approved template ROOT page URL/ID (not the bookshelf database). If absent, the existing NOTION_PAGE secret must point to that root; a bookshelf-only ID fails closed before writes. Do not change bookshelf Secrets to satisfy this module. If needed, set only the new repository variable during later deployment acceptance. No credentials or private page IDs are committed.
+The guarded workflow declares 09:00 Asia/Shanghai (`0 1 * * *` UTC), with no push/PR trigger. Schedule and manual dispatch default to read-only preview. The bookshelf workflow and its Secrets remain unchanged.
 
-Default execution is read-only preview:
+`READING_RECORDS_PAGE` is now a REQUIRED dedicated repository variable containing the confirmed ROOT page URL/ID. The CLI no longer falls back to the bookshelf NOTION_PAGE Secret. The dedicated variable has been set and read back to match the user-confirmed original template. Existing NOTION_TOKEN and WEREAD_API_KEY Secrets are only referenced, never modified. Root/schema discovery fails closed if integration access or the four database relationships are incorrect.
 
-```bash
-python -m weread2notion.reading_records --since 2026-08-01
-```
+### Preview and bounded first trial
 
-Only after explicit production acceptance:
+No trial has been run. First preview a deliberately small inclusive date window:
 
 ```bash
-python -m weread2notion.reading_records --since 2026-08-01 --apply
+python -m weread2notion.reading_records --since 2026-08-28 --until 2026-08-29 --max-writes 2
 ```
 
-The new workflow declares 09:00 Asia/Shanghai (`0 1 * * *` UTC), one daily job with a concurrency lock; the bookshelf job remains at 08:00. It has no push/pull_request trigger. Manual dispatch is available but has not been invoked. Once merged, the scheduled workflow uses --apply. Neither this PR nor tests perform production writes. Merging is therefore a separate deployment authorization, with preview and backup checks first.
+The prior real-data snapshot shows August 28 already exists unchanged, August 29 is missing (287 seconds), and their week/month/year pages already exist. Therefore this window is expected to propose one day creation and no existing-day/period changes. Source data can change: inspect a fresh preview before approval.
+
+Only after separate user authorization, use the identical window and cap:
+
+```bash
+python -m weread2notion.reading_records --since 2026-08-28 --until 2026-08-29 --max-writes 2 --apply
+```
+
+`--apply` requires all THREE explicit arguments (--since, --until, --max-writes). No missing argument is silently filled for writes. Dates must satisfy since <= until <= today. Missing API dates remain unknown. The upper date is passed to the unchanged monthly-fetch/plan functions, so an old trial window cannot expand to the current day.
+
+The cap counts **all logical page write operations**, including period creates, day creates, duration updates and missing-link repairs. If the entire plan exceeds it, no apply is called; there is no partial first-N truncation. Notion SDK automatic retries are disabled for this entry point to avoid unbudgeted uncertain creates. A failed call can still have an ambiguous server-side outcome; preview before retrying.
+
+In GitHub manual dispatch, choose mode=preview first with since=2026-08-28 and until=2026-08-29. After separate approval, mode=trial additionally requires max_writes=2; all three inputs are mandatory. Inputs are passed as environment values to a Python argument list, never interpolated into a shell. Trial mode does not enable future automatic writes or set acceptance flags.
+
+### Future automatic writes: two closed gates
+
+After first real-write acceptance passes, the user must explicitly authorize setting BOTH repository variables to the exact lowercase string `true`:
+
+- READING_RECORDS_FIRST_WRITE_ACCEPTED
+- READING_RECORDS_AUTO_WRITE_ENABLED
+
+Missing/false/either-one-only means scheduled runs remain previews. The code does not set either variable and cannot independently certify human acceptance. Both are presently absent. Once both are authorized, scheduled writes use an explicit end date (that run's Beijing today) and a total cap from READING_RECORDS_AUTO_MAX_WRITES (default 100). Over-budget plans stop before any write. Manual preview always remains read-only even if automatic writes are enabled.
+
+No merge, workflow dispatch, real Notion write or automatic-write enablement was performed during this safety stage. The old workflow invocation with bare --apply now fails before API calls instead of doing unbounded writes; it still needs the guarded YAML replacement before claiming default-preview deployment is ready.
 
 ## Historical backfill and data rules
 
@@ -59,18 +80,18 @@ If that service cannot be restored, a separate approved follow-up can generate a
 
 ## Acceptance steps (not performed against production)
 
-1. Confirm backup, intended root and existing integration access to all four databases. If NOTION_PAGE targets only the bookshelf, configure READING_RECORDS_PAGE as a repository variable; keep existing Secrets unchanged.
-2. Run a read-only preview from a trusted local environment using existing credentials. Review months, buckets, duplicate/conflict failures and proposed create/update counts. No sharing credentials in chat or artifacts.
-3. For a narrow first write trial after separate authorization, use a recent --since date: compare one existing day and one missing day to the official seconds; confirm preserved manual data and period links. --since is a lower bound through today, not a one-day upper bound.
-4. Confirm week/month/year SUM rollups, monthly/annual charts, original bookshelf status/time and notes. A chart pass does not prove the NotionHub heatmap refreshed.
-5. Repeat the same interval: unchanged durations/links must produce zero writes. Resolve duplicates or conflicting links manually before any retry; do not delete/recreate to bypass errors.
-6. Separately authorize full August-to-current apply and merging/enabling the daily schedule. Observe the next scheduled run and compare displayed data. No weekly full task is needed. Archive neither the original template nor its copy.
+1. Replace the existing reading_records.yml on the SAME PR branch with the delivered guarded file. Current Git credential lacks workflow scope; do not remove or weaken guards to bypass upload restrictions. Confirm both write-enabling variables remain absent/false and the dedicated root variable matches the selected template.
+2. Review PR and separately authorize merge only after its default-preview workflow is complete. Merging alone must not enable writes. Check the first scheduled preview and integration schema/permissions; do not alter bookshelf Secrets.
+3. Obtain a fresh read-only August 28–29 preview. Verify date bounds, complete proposed write count <=2, correct existing period IDs, and no changes to other dates. If conflicts or additional period creates exceed the cap, stop; do not simply raise it.
+4. After separate approval, perform that exact trial with max_writes=2. Compare official seconds, retained manual data and period relations; verify rollups/charts. Repeat preview and expect zero new changes. Heatmap remains a separate service and is not certified by this trial.
+5. Record user acceptance of the first write. Only then, with explicit authorization, set FIRST_WRITE_ACCEPTED and AUTO_WRITE_ENABLED true. A successful API response alone must not set these flags.
+6. Historical August-to-current apply still requires separately reviewed dates/budget (the prior plan required 91 page operations); it is never a side effect of the first narrow trial. Avoid independent concurrent writers and resolve any uncertain create outcome before retrying.
 
 ## Local verification
 
 `PYTHONPATH=src ../test-venv/bin/python -m unittest discover -s tests -v`
 
-32 tests passed: original 17 bookshelf tests plus 15 reading-record tests, with HTTP/socket transports blocked and synthetic data. Covers historical months, seconds, missing dates, timestamp/day boundaries, ISO week/year boundaries, existing/new days, missing period/link repair, repeat zero writes, duplicate dates/periods, schema mismatch, conflicting relations and pagination. No real Notion writes; actual live Notion API schema validation, relation propagation, default page bodies and chart refresh remain production acceptance items.
+44 tests validated: original 32 tests plus 12 safety tests (42 passed initially; two mock-counter fixture omissions were fixed and both affected tests passed targeted recheck), with HTTP/socket transports blocked and synthetic data. Covers historical months, seconds, missing dates, timestamp/day boundaries, ISO week/year boundaries, existing/new days, missing period/link repair, repeat zero writes, duplicate dates/periods, schema mismatch, conflicting relations and pagination. No real Notion writes; actual live Notion API schema validation, relation propagation, default page bodies and chart refresh remain production acceptance items.
 
 ## Legacy period compatibility and latest read-only preview
 

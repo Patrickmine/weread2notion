@@ -244,27 +244,57 @@ class Records:
                 self.counts['days_created'] += 1
 
 
-def main():
+def write_count(plan):
+    """Budget all page operations, including missing period pages."""
+    return len(plan[0]) + len(plan[1])
+
+
+def apply_with_limit(records, plan, limit):
+    if type(limit) is not int or limit <= 0:
+        raise ValueError('A positive --max-writes limit is required')
+    if write_count(plan) > limit:
+        raise ValueError(f'Plan requires {write_count(plan)} page writes; limit is {limit}. No writes performed.')
+    records.apply(plan)
+
+
+def parse_args(argv=None, today=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--since', type=date.fromisoformat, default=date(2026, 8, 1))
+    parser.add_argument('--since', type=date.fromisoformat)
+    parser.add_argument('--until', type=date.fromisoformat, help='Inclusive last permitted write date')
+    parser.add_argument('--max-writes', type=int, help='Total day and period page operations')
     parser.add_argument('--apply', action='store_true', help='Explicitly allow production writes')
-    args = parser.parse_args()
-    today = datetime.now(TZ).date()
-    if args.since > today:
-        parser.error('--since must not be in the future')
-    root = os.getenv('READING_RECORDS_PAGE') or os.getenv('NOTION_PAGE') or ''
+    args = parser.parse_args(argv)
+    today = today or datetime.now(TZ).date()
+    if args.apply and (args.since is None or args.until is None or args.max_writes is None):
+        parser.error('--apply requires explicit --since, --until and --max-writes')
+    args.since = args.since or date(2026, 8, 1)
+    args.until = args.until or today
+    if not args.since <= args.until <= today:
+        parser.error('Require --since <= --until <= today')
+    if args.max_writes is not None and args.max_writes <= 0:
+        parser.error('--max-writes must be positive')
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    # Never fall back to the bookshelf Secret: use its own confirmed root.
+    root = os.getenv('READING_RECORDS_PAGE') or ''
     match = NOTION_ID_IN_TEXT_PATTERN.search(root)
     if not match:
-        parser.error('Set READING_RECORDS_PAGE (root page) or existing NOTION_PAGE')
-    client = Client(auth=os.environ['NOTION_TOKEN'], notion_version=NOTION_VERSION)
+        raise ValueError('Set the dedicated READING_RECORDS_PAGE root-page variable')
+    # A failed/ambiguous create is not automatically retried beyond the budget.
+    client = Client(auth=os.environ['NOTION_TOKEN'], notion_version=NOTION_VERSION, max_retries=0)
     records = Records(client, match.group(0))
-    data = read_months(WeReadGatewayClient(os.environ['WEREAD_API_KEY']), args.since, today)
-    plan = records.plan(data, args.since, today)
+    data = read_months(WeReadGatewayClient(os.environ['WEREAD_API_KEY']), args.since, args.until)
+    plan = records.plan(data, args.since, args.until)
     print(json.dumps({'preview': not args.apply, 'api_days': len(data),
+                      'since': args.since.isoformat(), 'until': args.until.isoformat(),
                       'periods_to_create': len(plan[0]), 'days_to_write': len(plan[1]),
+                      'total_page_writes': write_count(plan), 'max_writes': args.max_writes,
                       'notion_read_requests': records.counts['requests']}, ensure_ascii=False))
     if args.apply:
-        records.apply(plan)
+        apply_with_limit(records, plan, args.max_writes)
         print(json.dumps(records.counts))
 
 
