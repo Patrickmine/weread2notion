@@ -1,0 +1,27 @@
+name: daily reading records
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+concurrency:
+  group: reading-records-${{ github.repository }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install .
+      - name: Sync daily reading duration
+        env:
+          WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE: ${{ secrets.NOTION_PAGE }}
+          READING_RECORDS_PAGE: ${{ vars.READING_RECORDS_PAGE }}
+        run: python -m weread2notion.reading_records --since 2026-08-01 --apply
