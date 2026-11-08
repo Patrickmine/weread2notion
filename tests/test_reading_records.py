@@ -1,7 +1,7 @@
 """Synthetic contract tests; production HTTP transports are forbidden."""
 import copy
 import unittest
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from unittest.mock import MagicMock, patch
 
 with patch('dotenv.load_dotenv'):
@@ -53,7 +53,7 @@ class ReadingRecordTests(unittest.TestCase):
         self.assertEqual(date_value({'date': {'start': '2026-08-01T00:00:00+08:00'}}), date(2026, 8, 1))
         self.assertEqual(date_value({'date': {'start': '2026-07-31T16:00:00Z'}}), date(2026, 8, 1))
         self.assertEqual(period(date(2027, 1, 1), '周'),
-                         (date(2026, 12, 28), date(2027, 1, 3), '2026年第53周'))
+                         (date(2026, 12, 28), date(2027, 1, 4), '2026年第53周'))
         with self.assertRaises(ValueError):
             date_value({'date': {'start': '2026-08-01T00:00:00'}})
 
@@ -186,6 +186,107 @@ class ReadingRecordTests(unittest.TestCase):
         rows['周'] = [{'id': str(i), 'properties': {'日期': prop_date(first, last)}} for i in range(2)]
         records = Records(client, 'root')
         with self.assertRaises(ValueError):
+            records.plan({day: 60}, day, day)
+        client.pages.create.assert_not_called()
+
+    def test_new_period_boundaries_follow_legacy_exclusive_end(self):
+        self.assertEqual(period(date(2026, 8, 1), '周'),
+                         (date(2026, 7, 27), date(2026, 8, 3), '2026年第31周'))
+        self.assertEqual(period(date(2026, 12, 31), '月'),
+                         (date(2026, 12, 1), date(2027, 1, 1), '2026年12月'))
+        self.assertEqual(period(date(2028, 2, 29), '月'),
+                         (date(2028, 2, 1), date(2028, 3, 1), '2028年2月'))
+        self.assertEqual(period(date(2026, 12, 31), '年'),
+                         (date(2026, 1, 1), date(2027, 1, 1), '2026'))
+
+    def test_existing_inclusive_exclusive_and_mixed_period_links_are_preserved(self):
+        for day in (date(2026, 8, 1), date(2027, 1, 1)):
+            for inclusive in (set(), {'周', '月', '年'}, {'月'}):
+                with self.subTest(day=day, inclusive=inclusive):
+                    client, rows, _ = self.fixture()
+                    props = {'日期': prop_date(day), '时长': {'number': 60}}
+                    for kind in ('周', '月', '年'):
+                        first, following, _ = period(day, kind)
+                        end = following - timedelta(days=1) if kind in inclusive else following
+                        rows[kind].append({'id': 'original-' + kind,
+                                           'properties': {'日期': prop_date(first, end)}})
+                        props[kind] = {'relation': [{'id': 'original-' + kind}]}
+                    rows['日'].append({'id': 'original-day', 'properties': props})
+                    before = copy.deepcopy(rows)
+                    records = Records(client, 'root')
+                    self.assertEqual(records.plan({day: 60}, day, day), ({}, []))
+                    self.assertEqual(rows, before)
+                    client.pages.update.assert_not_called()
+                    client.pages.create.assert_not_called()
+                    queries = [c.kwargs for c in client.request.call_args_list
+                               if c.kwargs['path'].endswith('/query')]
+                    week_query = next(q for q in queries if q['path'].endswith('source-周/query'))
+                    self.assertEqual(week_query['body']['filter']['and'][0]['date']['on_or_after'],
+                                     period(day, '周')[0].isoformat())
+
+    def test_unrelated_march_and_july_duplicates_do_not_block_august(self):
+        client, rows, _ = self.fixture()
+        for month in (3, 7):
+            first = date(2026, month, 1)
+            end = date(2026, month + 1, 1)
+            rows['月'].extend([{'id': f'old-{month}-{i}', 'properties': {'日期': prop_date(first, end)}}
+                              for i in range(2)])
+        before = copy.deepcopy(rows['月'])
+        records = Records(client, 'root')
+        plan = records.plan({date(2026, 8, 1): 60}, date(2026, 8, 1), date(2026, 8, 1))
+        self.assertEqual(len(plan[0]), 3)
+        self.assertEqual(len(plan[1]), 1)
+        self.assertEqual(rows['月'], before)
+        client.pages.create.assert_not_called()
+
+    def test_target_period_duplicates_rejected_even_with_different_end_styles(self):
+        for day in (date(2026, 8, 1), date(2027, 1, 1)):
+            for kind in ('周', '月', '年'):
+                with self.subTest(day=day, kind=kind):
+                    client, rows, _ = self.fixture()
+                    first, following, _ = period(day, kind)
+                    rows[kind] = [
+                        {'id': 'a', 'properties': {'日期': prop_date(first, following)}},
+                        {'id': 'b', 'properties': {'日期': prop_date(first, following - timedelta(days=1))}},
+                    ]
+                    records = Records(client, 'root')
+                    with self.assertRaisesRegex(ValueError, 'Duplicate period'):
+                        records.plan({day: 60}, day, day)
+                    client.pages.create.assert_not_called()
+                    client.pages.update.assert_not_called()
+
+    def test_unknown_day_duplicates_are_ignored_but_involved_day_duplicates_fail(self):
+        client, rows, _ = self.fixture()
+        unknown = date(2026, 11, 8)
+        rows['日'] = [{'id': str(i), 'properties': {'日期': prop_date(unknown)}} for i in range(2)]
+        records = Records(client, 'root')
+        plan = records.plan({date(2026, 11, 7): 60}, date(2026, 11, 1), unknown)
+        self.assertEqual(len(plan[1]), 1)
+        self.assertEqual(plan[1][0][1]['日期']['date']['start'], '2026-11-07')
+        with self.assertRaisesRegex(ValueError, 'Duplicate Notion date'):
+            records.plan({unknown: 60}, date(2026, 11, 1), unknown)
+        self.assertEqual(records.plan({}, date(2026, 11, 1), unknown), ({}, []))
+        client.pages.create.assert_not_called()
+        client.pages.update.assert_not_called()
+
+    def test_new_period_pages_use_exclusive_dates_without_editing_existing_periods(self):
+        client, rows, _ = self.fixture()
+        day = date(2027, 1, 1)
+        records = Records(client, 'root')
+        records.apply(records.plan({day: 60}, day, day))
+        expected = {'周': ('2026-12-28', '2027-01-04'),
+                    '月': ('2027-01-01', '2027-02-01'),
+                    '年': ('2027-01-01', '2028-01-01')}
+        for kind, (first, end) in expected.items():
+            self.assertEqual(rows[kind][0]['properties']['日期']['date'], {'start': first, 'end': end})
+        client.pages.update.assert_not_called()
+
+    def test_wrong_target_period_boundary_is_not_silently_duplicated(self):
+        client, rows, _ = self.fixture()
+        day = date(2026, 8, 1)
+        rows['月'] = [{'id': 'wrong', 'properties': {'日期': prop_date(day, date(2026, 8, 15))}}]
+        records = Records(client, 'root')
+        with self.assertRaisesRegex(ValueError, 'incompatible date boundaries'):
             records.plan({day: 60}, day, day)
         client.pages.create.assert_not_called()
 

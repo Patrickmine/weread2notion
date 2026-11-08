@@ -1,6 +1,5 @@
 """Independent daily-duration sync. Preview by default; never imports old Pro helpers."""
 import argparse
-import calendar
 import json
 import os
 from datetime import date, datetime, time, timedelta
@@ -62,10 +61,12 @@ def date_value(prop):
 def period(day, kind):
     if kind == '周':
         first = day - timedelta(days=day.weekday())
-        return first, first + timedelta(days=6), f'{day.isocalendar().year}年第{day.isocalendar().week}周'
+        return first, first + timedelta(days=7), f'{day.isocalendar().year}年第{day.isocalendar().week}周'
     if kind == '月':
-        return day.replace(day=1), day.replace(day=calendar.monthrange(day.year, day.month)[1]), f'{day.year}年{day.month}月'
-    return date(day.year, 1, 1), date(day.year, 12, 31), str(day.year)
+        first = day.replace(day=1)
+        following = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return first, following, f'{day.year}年{day.month}月'
+    return date(day.year, 1, 1), date(day.year + 1, 1, 1), str(day.year)
 
 
 class Records:
@@ -160,21 +161,34 @@ class Records:
                 {'property': '日期', 'date': {'on_or_before': today.isoformat()}}]}, 'page_size': 100})
 
     def plan(self, durations, start, today):
+        if not durations:
+            return {}, []
         days = {}
         for row in self.rows('日', start, today):
             day = date_value(row['properties'].get('日期'))
+            if day not in durations:
+                continue
             if day in days:
                 raise ValueError('Duplicate Notion date; no writes performed: ' + day.isoformat())
             days[day] = row
         periods = {}
         for kind in KINDS[1:]:
             index = {}
-            # Includes year starts and the ISO week crossing the year boundary.
-            for row in self.rows(kind, date(start.year, 1, 1) - timedelta(days=7), today):
+            # The first involved week can start before --since or before January.
+            needed = {period(day, kind)[0]: period(day, kind)[1] for day in durations}
+            for row in self.rows(kind, min(needed), max(needed)):
                 value = row['properties'].get('日期', {}).get('date') or {}
                 first = date.fromisoformat(value['start'][:10])
+                if first not in needed:
+                    continue
                 last = date.fromisoformat(value.get('end') or value['start'][:10])
-                key = (first, last)
+                following = needed[first]
+                if last not in (following, following - timedelta(days=1)):
+                    raise ValueError('Existing period has incompatible date boundaries: ' + kind)
+                # Reuse either legacy exclusive end or inclusive last-day end.
+                # Two pages for one involved cycle remain a conflict, even when
+                # their end-date conventions or titles differ.
+                key = (first, following)
                 if key in index:
                     raise ValueError('Duplicate period date range: ' + kind)
                 index[key] = row['id']
